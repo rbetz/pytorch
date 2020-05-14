@@ -1,5 +1,6 @@
 #pragma once
 
+#include <c10/util/Optional.h>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -82,6 +83,15 @@ const VContext& context();
 // copyFromImageToBuffer first.
 class VBuffer;
 class VImage;
+
+using ImageSize = std::array<uint32_t, 3>;
+std::ostream& operator<<(std::ostream& s, const ImageSize& is);
+struct ImageSizes {
+  ImageSize imageSize;
+  ImageSize dataSize;
+};
+std::ostream& operator<<(std::ostream& s, const ImageSizes& is);
+
 class VulkanTensor final {
   class Impl;
 
@@ -115,8 +125,17 @@ class VulkanTensor final {
 
   bool canBeImage() const;
   bool hasImage() const;
-  VImage* image();
-  const VImage* image() const;
+
+  VImage* image(c10::optional<ImageSizes> imageSizes);
+  const VImage* image(c10::optional<ImageSizes> imageSizes) const;
+
+  // XXX not to specify optional, how?
+  VImage* image() {
+    return image(c10::nullopt);
+  };
+  const VImage* image() const {
+    return image(c10::nullopt);
+  }
 
  private:
   std::shared_ptr<Impl> impl();
@@ -260,8 +279,9 @@ class VImage final {
       VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
   static constexpr VkImageViewType kImageViewType = VK_IMAGE_VIEW_TYPE_3D;
 
-  explicit VImage(uint32_t W, uint32_t H, uint32_t C);
-
+  explicit VImage(ImageSize imageSize, ImageSize dataSize);
+  explicit VImage(ImageSizes imageSizes)
+      : VImage(imageSizes.imageSize, imageSizes.dataSize) {}
   ~VImage();
   VImage(const VImage&) = delete;
   VImage& operator=(const VImage&) = delete;
@@ -269,16 +289,13 @@ class VImage final {
   VImage& operator=(VImage&&) = default;
 
   inline auto W() const {
-    return W_;
+    return imageSize_[0];
   }
   inline auto H() const {
-    return H_;
-  }
-  inline auto C() const {
-    return C_;
+    return imageSize_[1];
   }
   inline auto D() const {
-    return D_;
+    return imageSize_[2];
   }
 
   VkImageViewCreateInfo makeImageViewCreateInfo() const;
@@ -298,11 +315,15 @@ class VImage final {
   void bindShaderRead(VkDescriptorSet descriptorSet, uint32_t binding) const;
   void bindStorageImage(VkDescriptorSet descriptorSet, uint32_t binding) const;
   inline VkDeviceSize sizeBytes() const {
-    return sizeof(float) * W_ * H_ * C_;
+    return sizeof(float) * imageSize_[0] * imageSize_[1] * imageSize_[2];
   }
 
   inline VkDeviceSize capacityBytes() const {
-    return sizeof(float) * W_ * H_ * D_ * 4;
+    return sizeof(float) * imageSize_[0] * imageSize_[1] * imageSize_[2] * 4;
+  }
+
+  ImageSize sizes() const {
+    return imageSize_;
   }
 
   void addImageMemoryBarrier(
@@ -315,11 +336,8 @@ class VImage final {
       VkCommandBuffer commandBuffer) const;
 
  private:
-  uint32_t W_;
-  uint32_t H_;
-  uint32_t C_;
-  uint32_t D_;
-
+  ImageSize imageSize_;
+  ImageSize dataSize_;
   VkImage image_;
   VkDeviceMemory imageMemory_;
   VkImageView imageView_;
@@ -366,6 +384,7 @@ struct WorkGroupSize {
   uint32_t y;
   uint32_t z;
 };
+std::ostream& operator<<(std::ostream& s, const WorkGroupSize& wgs);
 
 class ComputeUnit final {
  public:

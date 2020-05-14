@@ -1,9 +1,11 @@
+#include <c10/util/Exception.h>
+#include <c10/util/Optional.h>
 #include <iostream>
 #include <limits>
 #include <vector>
-#include <c10/util/Exception.h>
-#include <c10/util/Optional.h>
+
 #include <ATen/native/vulkan/Vulkan.h>
+#include <ATen/native/vulkan/VulkanCommon.h>
 #include <ATen/native/vulkan/VulkanOps.h>
 
 namespace at {
@@ -175,59 +177,6 @@ VBuffer kernelNCHW_OCHW_repack_O4C4HWi4o4(
   return kernelBuffer;
 }
 
-VImage conv2d_kernelImage_from_hostCHW(
-    const float* data,
-    int64_t OC,
-    int64_t C,
-    int64_t KH,
-    int64_t KW) {
-  auto device = context().device();
-  auto kernelBuffer = kernelNCHW_OCHW_repack_O4C4HWi4o4(data, OC, C, KH, KW);
-  auto OC_4 = UP_DIV(OC, 4);
-  auto C_4 = UP_DIV(C, 4);
-
-  VImage kernelImage{C_4 * 4, OC_4, 4 * KH * KW};
-  struct ConstBlock {
-    int32_t KWxKH;
-    int32_t C_4;
-  };
-  ConstBlock cb{KW * KH, C_4};
-  VBuffer constBuffer = makeUniformConstBuffer((void*)&cb, sizeof(cb));
-
-  VkDescriptorSetLayout descriptorSetLayout{};
-  VkDescriptorPool descriptorPool{};
-  VkDescriptorSet descriptorSet{};
-  std::vector<VkDescriptorType> descriptorTypes{
-      VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-      VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-      VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER};
-  createDescriptorSetLayoutSinglePool(
-      device,
-      descriptorTypes,
-      &descriptorSetLayout,
-      &descriptorPool,
-      &descriptorSet);
-
-  kernelImage.bindStorageImage(descriptorSet, 0);
-  kernelBuffer.bind(descriptorSet, 1);
-  constBuffer.bind(descriptorSet, 2);
-
-  WorkGroupSize workGroupSize{1, 1, 1};
-  ComputeUnit computeUnit{at::native::vulkan::GLSL_SPV(vulkan_KO4C4HW_to_image),
-                          descriptorSetLayout,
-                          workGroupSize};
-  computeUnit.createCommandBuffer(descriptorSet);
-  auto commandBuffer = computeUnit.commandBuffer();
-  kernelImage.addImageMemoryBarrierUndefinedToGeneral(commandBuffer);
-  kernelBuffer.addBufferMemoryBarrier(
-      commandBuffer, 0, kernelBuffer.sizeBytes());
-  computeUnit.dispatchCommandBuffer(C_4, OC_4, KH * KW, workGroupSize);
-  computeUnit.runCommandBuffer();
-  vkDestroyDescriptorPool(device, descriptorPool, nullptr);
-  vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
-  return kernelImage;
-}
-
 void conv2dDepthWise(
     VulkanTensor& output,
     const VulkanTensor& input,
@@ -242,6 +191,7 @@ void conv2dDepthWise(
     int64_t DY,
     int64_t DX,
     int64_t G) {
+  COUT_FLF0;
   auto isizes = input.sizes();
   int64_t C = isizes[1];
   auto device = context().device();
@@ -323,13 +273,105 @@ void conv2dDepthWise(
   vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
 }
 
+ImageSizes conv2d_prepack_weights_image_sizes(
+    int64_t OC,
+    int64_t C,
+    int64_t KH,
+    int64_t KW) {
+  COUT_FLF0;
+  return {{ALIGN_UP4(C), UP_DIV(OC, 4), KH * KW}, {C, OC, KH * KW}};
+}
+
+void conv2d_prepack_weights_to_image(
+    VImage& image,
+    const float* weight,
+    int64_t OC,
+    int64_t C,
+    int64_t KH,
+    int64_t KW) {
+  COUT_FLF0;
+  auto device = context().device();
+  auto kernelBuffer = kernelNCHW_OCHW_repack_O4C4HWi4o4(weight, OC, C, KH, KW);
+  auto OC_4 = UP_DIV(OC, 4);
+  auto C_4 = UP_DIV(C, 4);
+
+  auto expectedSizes = conv2d_prepack_weights_image_sizes(OC, C, KH, KW);
+  std::cout << "expectedSizes: " << expectedSizes.imageSize << std::endl;
+  std::cout << "image.sizes:" << image.sizes() << std::endl;
+  TORCH_INTERNAL_ASSERT(image.sizes() == expectedSizes.imageSize, "XXX");
+
+  struct ConstBlock {
+    int32_t KWxKH;
+    int32_t C_4;
+  };
+  ConstBlock cb{KW * KH, C_4};
+  VBuffer constBuffer = makeUniformConstBuffer((void*)&cb, sizeof(cb));
+
+  VkDescriptorSetLayout descriptorSetLayout{};
+  VkDescriptorPool descriptorPool{};
+  VkDescriptorSet descriptorSet{};
+  std::vector<VkDescriptorType> descriptorTypes{
+      VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+      VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+      VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER};
+  createDescriptorSetLayoutSinglePool(
+      device,
+      descriptorTypes,
+      &descriptorSetLayout,
+      &descriptorPool,
+      &descriptorSet);
+
+  image.bindStorageImage(descriptorSet, 0);
+  kernelBuffer.bind(descriptorSet, 1);
+  constBuffer.bind(descriptorSet, 2);
+
+  WorkGroupSize workGroupSize{1, 1, 1};
+  ComputeUnit computeUnit{at::native::vulkan::GLSL_SPV(vulkan_KO4C4HW_to_image),
+                          descriptorSetLayout,
+                          workGroupSize};
+  computeUnit.createCommandBuffer(descriptorSet);
+  auto commandBuffer = computeUnit.commandBuffer();
+  image.addImageMemoryBarrierUndefinedToGeneral(commandBuffer);
+  kernelBuffer.addBufferMemoryBarrier(
+      commandBuffer, 0, kernelBuffer.sizeBytes());
+  computeUnit.dispatchCommandBuffer(C_4, OC_4, KH * KW, workGroupSize);
+  computeUnit.runCommandBuffer();
+  vkDestroyDescriptorPool(device, descriptorPool, nullptr);
+  vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
+}
+
+VImage conv2d_prepack_weights_image(
+    const float* weight,
+    int64_t OC,
+    int64_t C,
+    int64_t KH,
+    int64_t KW) {
+  COUT_FLF0;
+  VImage image{conv2d_prepack_weights_image_sizes(OC, C, KH, KW)};
+  conv2d_prepack_weights_to_image(image, weight, OC, C, KH, KW);
+  return image;
+}
+
+void conv2d_prepack_weights(
+    VulkanTensor& output,
+    const float* weight,
+    int64_t OC,
+    int64_t C,
+    int64_t KH,
+    int64_t KW) {
+  COUT_FLF0;
+  auto imageSizes = conv2d_prepack_weights_image_sizes(OC, C, KH, KW);
+  conv2d_prepack_weights_to_image(
+      *(output.image(imageSizes)), weight, OC, C, KH, KW);
+}
+
 void conv2d(
     VulkanTensor& output,
     const VulkanTensor& input,
-    const float* weight,
+    const VImage& kernelImage,
     int64_t KH,
     int64_t KW,
-    const float* bias,
+    const VBuffer& bias,
     int64_t SY,
     int64_t SX,
     int64_t PY,
@@ -337,20 +379,17 @@ void conv2d(
     int64_t DY,
     int64_t DX,
     int64_t G) {
+  COUT_FLF0;
+  // XXX kernelImage is used only for G==1, right? Enforce with asserts
+  TORCH_INTERNAL_ASSERT(G == 1, "XXX");
+  std::cout << "kernelImage.sizes:" << kernelImage.sizes() << std::endl;
+
   auto isizes = input.sizes();
   int64_t C = isizes[1];
-  if (G > 1) {
-    TORCH_INTERNAL_ASSERT(
-        G == C,
-        "Vulkan group convolutions except depthwise(groups==input channels) are not implemented");
-    conv2dDepthWise(
-        output, input, weight, KH, KW, bias, SY, SX, PY, PX, DY, DX, G);
-    return;
-  }
-
   auto device = context().device();
   auto osizes = output.sizes();
 
+  std::cout << "output.sizes:" << IntArrayRef(osizes) << std::endl;
   int64_t N = isizes[0];
   int64_t OC = osizes[1];
   int64_t H = isizes[2];
@@ -365,12 +404,6 @@ void conv2d(
 
   TORCH_INTERNAL_ASSERT(osizes[2] == OH);
   TORCH_INTERNAL_ASSERT(osizes[3] == OW);
-
-  auto biasBufferSize = sizeof(float) * ALIGN_UP4(OC);
-  auto biasBufferSizeAligned = ROUND_UP(
-      biasBufferSize, context().limits().minStorageBufferOffsetAlignment);
-  VBuffer biasBuffer{biasBufferSizeAligned};
-  biasBuffer.copyFromHostToDevice((void*)bias, biasBufferSize);
 
   struct ConstBlock {
     int32_t padding[2];
@@ -387,7 +420,6 @@ void conv2d(
                 {OW, OH, OC_4, OC},
                 {W, H, C_4, C}};
   VBuffer constBuffer = makeUniformConstBuffer((void*)&cb, sizeof(cb));
-  VImage kernelImage = conv2d_kernelImage_from_hostCHW(weight, OC, C, KH, KW);
 
   VkDescriptorSetLayout descriptorSetLayout{};
   VkDescriptorPool descriptorPool{};
@@ -405,13 +437,17 @@ void conv2d(
       &descriptorPool,
       &descriptorSet);
 
+  COUT_FLFE;
   output.image()->bind(
       descriptorSet,
       0,
       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
       VK_IMAGE_LAYOUT_GENERAL);
+  COUT_FLFE;
   input.image()->bindShaderRead(descriptorSet, 1);
+  COUT_FLFE;
   kernelImage.bindShaderRead(descriptorSet, 2);
+  COUT_FLFE;
   biasBuffer.bind(descriptorSet, 3);
   constBuffer.bind(descriptorSet, 4);
 
@@ -432,6 +468,124 @@ void conv2d(
 
   vkDestroyDescriptorPool(device, descriptorPool, nullptr);
   vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
+}
+void conv2d(
+    VulkanTensor& output,
+    const VulkanTensor& input,
+    const VImage& kernelImage,
+    int64_t KH,
+    int64_t KW,
+    const c10::optional<const float*> bias,
+    int64_t SY,
+    int64_t SX,
+    int64_t PY,
+    int64_t PX,
+    int64_t DY,
+    int64_t DX,
+    int64_t G) {
+  COUT_FLF0;
+  // XXX kernelImage is used only for G==1, right? Enforce with asserts
+  TORCH_INTERNAL_ASSERT(G == 1, "XXX");
+  std::cout << "kernelImage.sizes:" << kernelImage.sizes() << std::endl;
+
+  auto isizes = input.sizes();
+  int64_t C = isizes[1];
+  auto device = context().device();
+  auto osizes = output.sizes();
+
+  std::cout << "output.sizes:" << IntArrayRef(osizes) << std::endl;
+  int64_t N = isizes[0];
+  int64_t OC = osizes[1];
+  int64_t H = isizes[2];
+  int64_t W = isizes[3];
+  const int64_t OC_4 = UP_DIV(OC, 4);
+  const int64_t C_4 = UP_DIV(C, 4);
+
+  const int64_t KWE = (KW - 1) * DX + 1;
+  const int64_t KHE = (KH - 1) * DY + 1;
+  const int64_t OW = ((W - KWE + 2 * PX) / SX) + 1;
+  const int64_t OH = ((H - KHE + 2 * PY) / SY) + 1;
+
+  TORCH_INTERNAL_ASSERT(osizes[2] == OH);
+  TORCH_INTERNAL_ASSERT(osizes[3] == OW);
+
+  auto biasBufferSize = sizeof(float) * ALIGN_UP4(OC);
+  auto biasBufferSizeAligned = ROUND_UP(
+      biasBufferSize, context().limits().minStorageBufferOffsetAlignment);
+  VBuffer biasBuffer{biasBufferSizeAligned};
+  if (bias.has_value()) {
+    biasBuffer.copyFromHostToDevice((void*)*bias, biasBufferSize);
+  } else {
+    biasBuffer.set_zeros();
+  }
+  conv2d(output, input, kernelImage, biasBuffer, SY, SX, PY, PX, DY, DX, G);
+}
+
+void conv2d(
+    VulkanTensor& output,
+    const VulkanTensor& input,
+    const VulkanTensor& weight_prepacked,
+    int64_t KH,
+    int64_t KW,
+    c10::optional<const float*> bias,
+    int64_t SY,
+    int64_t SX,
+    int64_t PY,
+    int64_t PX,
+    int64_t DY,
+    int64_t DX,
+    int64_t G) {
+  COUT_FLF0;
+  // XXX asserts?
+  conv2d(
+      output,
+      input,
+      *(weight_prepacked.image()),
+      KH,
+      KW,
+      bias,
+      SY,
+      SX,
+      PY,
+      PX,
+      DY,
+      DX,
+      G);
+}
+
+void conv2d(
+    VulkanTensor& output,
+    const VulkanTensor& input,
+    const float* weight,
+    int64_t KH,
+    int64_t KW,
+    const c10::optional<const float*> bias,
+    int64_t SY,
+    int64_t SX,
+    int64_t PY,
+    int64_t PX,
+    int64_t DY,
+    int64_t DX,
+    int64_t G) {
+  COUT_FLF0;
+  auto isizes = input.sizes();
+  int64_t C = isizes[1];
+  if (G > 1) {
+    TORCH_INTERNAL_ASSERT(
+        G == C,
+        "Vulkan group convolutions except depthwise(groups==input channels) are not implemented");
+    conv2dDepthWise(
+        output, input, weight, KH, KW, bias, SY, SX, PY, PX, DY, DX, G);
+    return;
+  }
+
+  auto device = context().device();
+  auto osizes = output.sizes();
+
+  int64_t OC = osizes[1];
+  const VImage kernelImage =
+      conv2d_prepack_weights_image(weight, OC, C, KH, KW);
+  conv2d(output, input, kernelImage, KH, KW, bias, SY, SX, PY, PX, DY, DX, G);
 }
 
 void clamp(

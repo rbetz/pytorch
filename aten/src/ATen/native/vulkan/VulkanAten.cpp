@@ -49,7 +49,7 @@ at::Tensor new_with_vtensor_vulkan(VTensor&& vt, const TensorOptions& options) {
 }
 
 VTensor& vtensor_from_vulkan(const at::Tensor& tensor) {
-  AT_ASSERTM(
+  TORCH_INTERNAL_ASSERT(
       tensor.is_vulkan(), "vtensor_from_vulkan expects Vulkan tensor input");
   VulkanTensorImpl* impl =
       static_cast<VulkanTensorImpl*>(tensor.unsafeGetTensorImpl());
@@ -72,18 +72,19 @@ at::Tensor empty_vulkan(
 }
 
 at::Tensor& copy_from_vulkan_(at::Tensor& self, const at::Tensor& src) {
-  AT_ASSERTM(
+  TORCH_INTERNAL_ASSERT(
       src.device().type() == DeviceType::Vulkan,
       "copy_from_vulkan input tensor's device is not Vulkan");
-  AT_ASSERTM(
+  TORCH_INTERNAL_ASSERT(
       self.device().type() == DeviceType::CPU,
       "copy_from_vulkan is implemented only for CPU device output");
-  AT_ASSERTM(
+  TORCH_INTERNAL_ASSERT(
       self.layout() == Layout::Strided,
       "copy_from_vulkan is implemented only for Strided layout output");
-  AT_ASSERTM(
+  TORCH_INTERNAL_ASSERT(
       self.scalar_type() == ScalarType::Float,
-      "copy_from_vulkan is implemented only for float dtype output");
+      "copy_from_vulkan is implemented only for float dtype output, got:",
+      self.scalar_type());
 
   VTensor& vtensor = vtensor_from_vulkan(src);
   vtensor.copyDataToHost(self.template data_ptr<float>());
@@ -91,16 +92,16 @@ at::Tensor& copy_from_vulkan_(at::Tensor& self, const at::Tensor& src) {
 }
 
 at::Tensor& copy_to_vulkan_(at::Tensor& self, const at::Tensor& src) {
-  AT_ASSERTM(
+  TORCH_INTERNAL_ASSERT(
       self.device().type() == DeviceType::Vulkan,
       "copy_to_vulkan output tensor's device is not Vulkan");
-  AT_ASSERTM(
+  TORCH_INTERNAL_ASSERT(
       src.device().type() == DeviceType::CPU,
       "copy_to_vulkan is implemented only for CPU device input");
-  AT_ASSERTM(
+  TORCH_INTERNAL_ASSERT(
       src.layout() == Layout::Strided,
       "copy_to_vulkan is implemented only for Strided layout input");
-  AT_ASSERTM(
+  TORCH_INTERNAL_ASSERT(
       src.scalar_type() == ScalarType::Float,
       "copy_to_vulkan is implemented only for float dtype");
 
@@ -117,7 +118,7 @@ at::Tensor& vulkan_copy_(at::Tensor& self, const at::Tensor& src) {
   if (src.device().type() == at::kCPU && self.device().type() == at::kVulkan) {
     return copy_to_vulkan_(self, src);
   }
-  AT_ASSERTM(
+  TORCH_INTERNAL_ASSERT(
       src.device().type() == DeviceType::Vulkan,
       "vulkan_copy_ is implemented only for CPU,Strided,float->Vulkan; Vulkan->CPU,Strided,float");
   return self;
@@ -230,6 +231,99 @@ at::Tensor vulkan_convolution(
   return new_with_vtensor_vulkan(std::move(voutput), input.options());
 }
 
+at::Tensor vulkan_convolution_prepack_weights(const at::Tensor& weight) {
+  auto wsizes = weight.sizes();
+  TORCH_INTERNAL_ASSERT(
+      wsizes.size() == 4,
+      "vulkan_convolution_prepack_weights: Expected 4-dimensional weight");
+
+  int64_t OC = wsizes[0];
+  int64_t C = wsizes[1];
+  int64_t KH = wsizes[2];
+  int64_t KW = wsizes[3];
+  // XXX What sizes should have prepacked weights?
+  VTensor voutput = VTensor{{OC, C, KH, KW}};
+  voutput.allocateStorage();
+
+  float* weightData = weight.template data_ptr<float>();
+
+  at::native::vulkan::details::VULKAN_GL::conv2d_prepack_weights(
+      voutput, weightData, OC, C, KH, KW);
+  return new_with_vtensor_vulkan(
+      std::move(voutput), at::device(at::kCPU).dtype(at::kFloat));
+}
+
+at::Tensor vulkan_convolution_prepacked(
+    const at::Tensor& input, // Vulkan
+    const at::Tensor& weight_prepacked_vulkan, // Vulkan
+    const c10::optional<at::Tensor>& bias, // Vulkan/CPU
+    IntArrayRef padding,
+    IntArrayRef stride,
+    IntArrayRef dilation,
+    int64_t groups) {
+  auto isizes = input.sizes();
+  TORCH_INTERNAL_ASSERT(
+      isizes.size() == 4, "vulkan_convolution: Expected 4-dimensional input");
+  auto wsizes = weight_prepacked_vulkan.sizes();
+  TORCH_INTERNAL_ASSERT(
+      wsizes.size() == 4, "vulkan_convolution: Expected 4-dimensional weight");
+  int64_t C = isizes[1];
+  TORCH_INTERNAL_ASSERT(
+      groups == 1 || groups == C,
+      "vulkan_convolution: only nogroup or depthwise convolutions supported");
+
+  int64_t N = isizes[0];
+  int64_t H = isizes[2];
+  int64_t W = isizes[3];
+
+  int64_t OC = wsizes[0];
+  int64_t KH = wsizes[2];
+  int64_t KW = wsizes[3];
+
+  int64_t PY = padding[0];
+  int64_t PX = padding[1];
+
+  int64_t SY = stride[0];
+  int64_t SX = stride[1];
+
+  int64_t DY = dilation[0];
+  int64_t DX = dilation[1];
+
+  const int KWE = (KW - 1) * DX + 1;
+  const int KHE = (KH - 1) * DY + 1;
+  const int64_t OW = ((W - KWE + 2 * PX) / SX) + 1;
+  const int64_t OH = ((H - KHE + 2 * PY) / SY) + 1;
+
+  auto osizes = std::vector<int64_t>{N, OC, OH, OW};
+
+  const VTensor& vinput = vtensor_from_vulkan(input);
+  const VTensor& vweight = vtensor_from_vulkan(weight_prepacked_vulkan);
+  VTensor voutput = VTensor{osizes};
+  voutput.allocateStorage();
+
+  float* biasData{};
+  if (bias.defined()) {
+    biasData = bias.template data_ptr<float>();
+  } else {
+    biasData = (float*)std::malloc(sizeof(float) * OC);
+    std::memset(biasData, 0, sizeof(float) * OC);
+  }
+  at::native::vulkan::details::VULKAN_GL::conv2d(
+      voutput,
+      vinput,
+      vweight,
+      KH,
+      KW,
+      biasData,
+      SY,
+      SX,
+      PY,
+      PX,
+      DY,
+      DX,
+      groups);
+  return new_with_vtensor_vulkan(std::move(voutput), input.options());
+}
 Tensor vulkan_addmm(
     const Tensor& self,
     const Tensor& mat1,
